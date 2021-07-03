@@ -1,4 +1,5 @@
 #include <iostream>
+#include <mutex>
 #include <thread>
 #include <functional>
 #include <string>
@@ -54,6 +55,8 @@ class Session:public std::enable_shared_from_this<Session> {
     std::string read_buffer;
     size_t write_bytes;
     size_t read_bytes;
+    std::mutex destroy_mtx;
+    bool destroy_flag;
     void onRead(size_t read_bytes_);
     void onWrite(size_t write_bytes_);
     void destroy();
@@ -61,7 +64,7 @@ class Session:public std::enable_shared_from_this<Session> {
 
 Session::Session(const std::shared_ptr<socket_type> &sock_):
     sock(sock_),write_bytes(0),read_bytes(0),
-    write_buffer(MAXBUFFERSIZE,0),read_buffer(MAXBUFFERSIZE,0) {
+    write_buffer(MAXBUFFERSIZE,0),read_buffer(MAXBUFFERSIZE,0),destroy_flag(false) {
 };
 
 void Session::run() {
@@ -69,6 +72,12 @@ void Session::run() {
     handleRead();
 }
 void Session::destroy() {
+    std::lock_guard<std::mutex> lock(destroy_mtx);
+    if (destroy_flag) {
+        Log::Logging<Log::warning>("Session destroy:","already done");
+        return;
+    }
+    destroy_flag = true;
     Log::Logging<Log::warning>("Session destroy");
     if (sock->is_open()) {
         system::error_code error;
@@ -76,6 +85,8 @@ void Session::destroy() {
         if (error.value()) Log::Logging<Log::warning>("Session destroy:",error.message());
         sock->close(error);
         if (error.value()) Log::Logging<Log::warning>("Session destroy:",error.message());
+    } else {
+        Log::Logging<Log::warning>("Session destroy:","socket already closed");
     }
 }
 
@@ -203,6 +214,7 @@ void Server::handleAccept() {
 
 int main(){
     Log::Log.lv = Log::info;
+
     Server s("::",13579);
     Log::Logging<Log::warning>("server created");
     s.run();
