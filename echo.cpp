@@ -1,7 +1,8 @@
 #include <iostream>
-#include <mutex>
 #include <thread>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <system_error>
 
@@ -39,6 +40,33 @@ namespace Log {
         }
     }
 }
+
+// semaphore didn't appear until C++20
+class Semaphore {
+    public:
+    Semaphore();
+    void p();
+    void v();
+    private:
+    size_t count;
+    std::mutex mtx;
+    std::condition_variable cond;
+};
+
+Semaphore::Semaphore():count(0){};
+void Semaphore::p() {
+    std::unique_lock<std::mutex> lock(mtx);
+    if (count==0) {
+        cond.wait(lock,[this](){return count>0;});
+        --count;
+    }
+}
+void Semaphore::v() {
+    std::unique_lock<std::mutex> lock(mtx);
+    ++count;
+    if (count>0) cond.notify_one();
+}
+
 
 class Session:public std::enable_shared_from_this<Session> {
     public:
@@ -145,21 +173,37 @@ class Server {
     public:
     using socket_type = Session::socket_type;
     const size_t LISTEN_BACKLOG = 128;
+    // MAX threads
+    const size_t MAX_THREADS = 4;
     Server(const std::string &ip, const uint16_t &port);
     void run();
+    // run in child threads (multithreading)
+    void subthreadRun();
     private:
     void handleAccept();
     void destroy();
     asio::io_context ioctx;
     asio::ip::tcp::endpoint ep;
     asio::ip::tcp::acceptor acceptor;
+    // only destroy once
+    std::mutex destroy_mtx;
+    bool destroy_flag;
+    // support for multithreading, main should be run before child threads can run
+    Semaphore run_smph;
 };
 
 Server::Server(const std::string &ip, const uint16_t &port):
-    ioctx(),ep(asio::ip::address::from_string(ip),port),acceptor(ioctx){
+    ioctx(),ep(asio::ip::address::from_string(ip),port),acceptor(ioctx),
+    destroy_flag(false){
 };
 
 void Server::destroy() {
+    std::lock_guard<std::mutex> lock(destroy_mtx);
+    if (destroy_flag) {
+        Log::Logging<Log::warning>("Server destroy:","already destroyed");
+        return;
+    }
+    destroy_flag = true;
     Log::Logging<Log::warning>("Server destroy");
     if (acceptor.is_open()) {
         system::error_code error;
@@ -193,7 +237,12 @@ void Server::run() {
         return;
     }
     handleAccept();
+    for (int i=0;i<MAX_THREADS;++i) run_smph.v();
+    ioctx.run();
+}
 
+void Server::subthreadRun(){
+    run_smph.p();
     ioctx.run();
 }
 
@@ -215,10 +264,25 @@ void Server::handleAccept() {
 int main(){
     Log::Log.lv = Log::info;
 
+    /// 3 ///
     Server s("::",13579);
     Log::Logging<Log::warning>("server created");
-    s.run();
+    std::thread t([&s](){s.run();});
+    std::thread t1([&s](){s.subthreadRun();});
+    std::thread t2([&s](){s.subthreadRun();});
+    t.join();
+    Log::Logging<Log::info>("thread t", "terminated");
+    t1.join();
+    Log::Logging<Log::info>("thread t1", "terminated");
+    t2.join();
+    Log::Logging<Log::info>("thread t2", "terminated");
     
+    /// 2 ///
+    // Server s("::",13579);
+    // Log::Logging<Log::warning>("server created");
+    // s.run();
+    
+    /// 1 ///
     // Server s1("::ffff:127.0.0.1",13579),s2("::ffff:192.168.233.5",13579);
     // Log::Logging<Log::warning>("server created");
     // std::thread t1([&s1](){s1.run();});
